@@ -1,0 +1,255 @@
+"""
+PPE (Helmet & Safety Vest) Detection Dashboard
+-----------------------------------------------
+Run with:  streamlit run app.py
+"""
+
+import time
+from collections import defaultdict
+
+import av
+import cv2
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+from streamlit_webrtc import WebRtcMode, webrtc_streamer
+
+from utils.detector import PPEDetector
+
+# ---------------------------------------------------------------------------
+# Page config & session state
+# ---------------------------------------------------------------------------
+st.set_page_config(page_title="PPE Detection Dashboard", page_icon="🦺", layout="wide")
+
+if "history" not in st.session_state:
+    # rolling log of detections: list of dicts {time, class, count}
+    st.session_state.history = []
+if "cumulative_counts" not in st.session_state:
+    st.session_state.cumulative_counts = defaultdict(int)
+
+
+@st.cache_resource(show_spinner="Loading YOLOv8 model...")
+def load_detector(model_path: str, conf: float):
+    return PPEDetector(model_path=model_path, conf=conf)
+
+
+def log_detection(class_counts: dict):
+    ts = time.strftime("%H:%M:%S")
+    for cls, cnt in class_counts.items():
+        st.session_state.history.append({"time": ts, "class": cls, "count": cnt})
+        st.session_state.cumulative_counts[cls] += cnt
+    # keep last 500 rows so the app doesn't grow unbounded
+    st.session_state.history = st.session_state.history[-500:]
+
+
+# ---------------------------------------------------------------------------
+# Sidebar — model & mode selection
+# ---------------------------------------------------------------------------
+st.sidebar.title("⚙️ Settings")
+
+model_path = st.sidebar.text_input(
+    "Model weights path", value="models/ppe.pt",
+    help="Path to a YOLOv8 .pt file. Use a PPE-trained model for helmet/vest "
+         "detection, or 'yolov8n.pt' for a quick person-only test."
+)
+conf_threshold = st.sidebar.slider("Confidence threshold", 0.1, 0.9, 0.4, 0.05)
+
+mode = st.sidebar.radio(
+    "Mode",
+    ["📷 Live Webcam", "🖼️ Upload Image", "🎞️ Upload Video", "📊 Dashboard"],
+)
+
+st.sidebar.markdown("---")
+st.sidebar.caption(
+    "Tip: download a PPE-specific YOLOv8 model (trained on helmet/vest data) "
+    "and drop the `.pt` file into the `models/` folder. See README.md."
+)
+
+try:
+    detector = load_detector(model_path, conf_threshold)
+    detector.conf = conf_threshold
+    model_ok = True
+except FileNotFoundError as e:
+    st.sidebar.error(str(e))
+    model_ok = False
+
+st.title("🦺 PPE Detection Dashboard")
+st.caption("Helmet & Safety Vest compliance monitoring — powered by YOLOv8 + Streamlit")
+
+if model_ok and detector.is_coco_only():
+    st.warning(
+        "⚠️ The loaded model only knows generic COCO classes (e.g. 'person'). "
+        "It cannot detect helmets or vests. Load a PPE-trained model for real "
+        "compliance detection — see README.md for download links.",
+        icon="⚠️",
+    )
+
+if not model_ok:
+    st.stop()
+
+# ---------------------------------------------------------------------------
+# Shared metric row renderer
+# ---------------------------------------------------------------------------
+def render_metrics(result):
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total detections", result.total_detections)
+    c2.metric("✅ Compliant people", result.compliant_people)
+    c3.metric("❌ Non-compliant flags", result.non_compliant_people)
+    total_people = result.compliant_people + result.non_compliant_people
+    rate = (result.compliant_people / total_people * 100) if total_people else 0
+    c4.metric("Compliance rate", f"{rate:.0f}%")
+
+
+# ---------------------------------------------------------------------------
+# MODE 1 — Live Webcam (real-time via WebRTC)
+# ---------------------------------------------------------------------------
+if mode == "📷 Live Webcam":
+    st.subheader("Live Webcam Detection")
+    st.caption("Click START below and allow camera access in your browser.")
+
+    latest_counts = {"value": {}}
+
+    def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
+        img = frame.to_ndarray(format="bgr24")
+        result = detector.detect(img)
+        latest_counts["value"] = result.class_counts
+        return av.VideoFrame.from_ndarray(result.annotated_frame, format="bgr24")
+
+    webrtc_streamer(
+        key="ppe-live",
+        mode=WebRtcMode.SENDRECV,
+        video_frame_callback=video_frame_callback,
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True,
+    )
+
+    st.info(
+        "Live counts update per-frame inside the video stream above. "
+        "For a persistent, loggable count, use 'Upload Image' or 'Upload Video' mode, "
+        "which record results into the Dashboard."
+    )
+
+# ---------------------------------------------------------------------------
+# MODE 2 — Upload Image
+# ---------------------------------------------------------------------------
+elif mode == "🖼️ Upload Image":
+    st.subheader("Upload an Image")
+    uploaded = st.file_uploader("Choose an image", type=["jpg", "jpeg", "png", "bmp"])
+
+    if uploaded is not None:
+        file_bytes = np.frombuffer(uploaded.read(), np.uint8)
+        img_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
+        with st.spinner("Running detection..."):
+            result = detector.detect(img_bgr)
+
+        col1, col2 = st.columns(2)
+        col1.image(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), caption="Original", use_container_width=True)
+        col2.image(
+            cv2.cvtColor(result.annotated_frame, cv2.COLOR_BGR2RGB),
+            caption="Detected", use_container_width=True,
+        )
+
+        render_metrics(result)
+
+        if result.class_counts:
+            st.dataframe(
+                pd.DataFrame(
+                    [{"Class": k, "Count": v} for k, v in result.class_counts.items()]
+                ),
+                use_container_width=True, hide_index=True,
+            )
+            log_detection(result.class_counts)
+        else:
+            st.info("No objects detected above the confidence threshold.")
+
+# ---------------------------------------------------------------------------
+# MODE 3 — Upload Video
+# ---------------------------------------------------------------------------
+elif mode == "🎞️ Upload Video":
+    st.subheader("Upload a Video")
+    uploaded = st.file_uploader("Choose a video", type=["mp4", "avi", "mov", "mkv"])
+    frame_skip = st.slider("Process every Nth frame (higher = faster)", 1, 10, 3)
+
+    if uploaded is not None:
+        tmp_path = f"/tmp/{uploaded.name}"
+        with open(tmp_path, "wb") as f:
+            f.write(uploaded.read())
+
+        cap = cv2.VideoCapture(tmp_path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        stframe = st.empty()
+        progress = st.progress(0)
+        metrics_placeholder = st.empty()
+
+        frame_idx = 0
+        aggregate_counts = defaultdict(int)
+        stop = st.button("⏹ Stop early")
+
+        while cap.isOpened() and not stop:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame_idx += 1
+
+            if frame_idx % frame_skip == 0:
+                result = detector.detect(frame)
+                for k, v in result.class_counts.items():
+                    aggregate_counts[k] += v
+                stframe.image(
+                    cv2.cvtColor(result.annotated_frame, cv2.COLOR_BGR2RGB),
+                    channels="RGB", use_container_width=True,
+                )
+                with metrics_placeholder.container():
+                    render_metrics(result)
+
+            if total_frames:
+                progress.progress(min(frame_idx / total_frames, 1.0))
+
+        cap.release()
+        st.success("Video processing complete.")
+
+        if aggregate_counts:
+            st.dataframe(
+                pd.DataFrame(
+                    [{"Class": k, "Total Count": v} for k, v in aggregate_counts.items()]
+                ),
+                use_container_width=True, hide_index=True,
+            )
+            log_detection(aggregate_counts)
+
+# ---------------------------------------------------------------------------
+# MODE 4 — Dashboard
+# ---------------------------------------------------------------------------
+elif mode == "📊 Dashboard":
+    st.subheader("Detection History & Compliance Dashboard")
+
+    if not st.session_state.history:
+        st.info("No detections logged yet. Run 'Upload Image' or 'Upload Video' mode first.")
+    else:
+        df = pd.DataFrame(st.session_state.history)
+
+        cum_df = pd.DataFrame(
+            [{"Class": k, "Total Count": v} for k, v in st.session_state.cumulative_counts.items()]
+        ).sort_values("Total Count", ascending=False)
+
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            st.markdown("**Cumulative counts by class**")
+            st.dataframe(cum_df, use_container_width=True, hide_index=True)
+        with col2:
+            fig = px.bar(cum_df, x="Class", y="Total Count", color="Class",
+                         title="PPE Class Distribution")
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("**Detections over time**")
+        fig2 = px.line(df, x="time", y="count", color="class", markers=True)
+        st.plotly_chart(fig2, use_container_width=True)
+
+        if st.button("🗑️ Clear history"):
+            st.session_state.history = []
+            st.session_state.cumulative_counts = defaultdict(int)
+            st.rerun()
