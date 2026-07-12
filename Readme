@@ -1,0 +1,100 @@
+# 🦺 PPE (Helmet & Safety Vest) Detection Dashboard
+
+A Streamlit app that uses YOLOv8 to detect helmets and safety vests from a
+live webcam, an uploaded image, or an uploaded video — no model training required.
+
+## Features
+- 📷 **Live webcam detection** (real-time, via `streamlit-webrtc`)
+- 🖼️ **Upload image** detection with side-by-side original/annotated view
+- 🎞️ **Upload video** detection with frame-skipping for speed
+- 📊 **Dashboard**: cumulative class counts, compliance rate, time-series chart
+- ✅/❌ Compliant vs non-compliant people counter
+
+## Project structure
+```
+ppe_detection_app/
+├── app.py                 # Streamlit UI (4 modes)
+├── requirements.txt
+├── utils/
+│   └── detector.py        # YOLOv8 wrapper + drawing/counting logic
+├── models/
+│   └── ppe.pt              # <-- put your PPE-trained YOLOv8 weights here
+└── sample_data/            # put test images/videos here (optional)
+```
+
+## 1. Setup
+
+```bash
+cd ppe_detection_app
+python -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+## 2. Get PPE detection weights (no training needed)
+
+A stock `yolov8n.pt` only knows COCO classes (person, car, dog, ...) — it does
+**not** know "helmet" or "safety vest". You need weights fine-tuned on a PPE
+dataset. Easiest options, no training required:
+
+**Option A — Roboflow Universe (recommended, free)**
+1. Go to https://universe.roboflow.com and search "PPE detection" or
+   "Construction Site Safety" (there are many public pre-trained YOLOv8 models,
+   e.g. models trained on the popular "Construction Site Safety Image Dataset"
+   with classes: `Hardhat, Mask, NO-Hardhat, NO-Mask, NO-Safety Vest, Person,
+   Safety Cone, Safety Vest, machinery, vehicle`).
+2. Open a model page → "Deploy" tab → download the YOLOv8 `.pt` weights
+   (Roboflow lets you export trained weights directly, or use their hosted
+   inference API if you prefer not to download).
+3. Rename the file to `ppe.pt` and place it in the `models/` folder.
+
+**Option B — Hugging Face Hub**
+Search for community PPE/hard-hat YOLOv8 checkpoints (several exist under
+tags like `keremberke/yolov8*-construction-safety` or similar hard-hat
+detection repos) and download the `.pt` file into `models/ppe.pt`.
+
+**Option C — Quick test with generic COCO model**
+If you just want to confirm the app runs, set the model path in the sidebar
+to `yolov8n.pt` (Ultralytics will auto-download it). It will only detect
+`person`, not helmets/vests — the app will show a warning banner in this case.
+
+> ⚠️ The class names in `utils/detector.py` (`POSITIVE_CLASSES`,
+> `NEGATIVE_CLASSES`, `PERSON_CLASSES`) assume the common
+> `Hardhat / NO-Hardhat / Safety Vest / NO-Safety Vest / Person` naming
+> scheme. If your chosen model uses different label names (e.g. `helmet`,
+> `no-helmet`), just add them to those sets — no code logic changes needed.
+
+## 3. Run the app
+
+```bash
+streamlit run app.py
+```
+
+Then open the URL Streamlit prints (usually http://localhost:8501).
+
+## 4. Usage
+- **Live Webcam**: select the mode, click "START", allow camera permission.
+- **Upload Image / Video**: drag and drop a file; annotated results and
+  counts appear automatically and are logged to the Dashboard.
+- **Dashboard**: view cumulative PPE class counts, compliance rate over time,
+  and a chart of detections. Click "Clear history" to reset.
+
+## Notes & tips
+- Adjust the **confidence threshold** slider in the sidebar to reduce false
+  positives/negatives.
+- For video mode, increase "Process every Nth frame" to speed up processing
+  on longer clips.
+- `compliant_people` / `non_compliant_people` are computed heuristically:
+  any `NO-Hardhat` / `NO-Safety Vest` (etc.) detection counts as a
+  non-compliance flag; remaining detected people are counted as compliant.
+  Adjust the logic in `utils/detector.py` -> `PPEDetector.detect()` if your
+  use case needs stricter per-person matching (e.g. matching each hardhat box
+  to a specific person box via IoU/overlap).
+
+## Troubleshooting
+- **Webcam not showing up**: browsers require HTTPS or `localhost` for camera
+  access; if deploying remotely, serve over HTTPS.
+- **Model not found error**: double check the path typed in the sidebar
+  matches where you placed the `.pt` file.
+- **Slow inference on CPU**: use a smaller model variant (`yolov8n` size) and/or
+  increase frame skipping in video mode.

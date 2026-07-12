@@ -1,0 +1,120 @@
+"""
+PPE Detector
+------------
+Thin wrapper around an Ultralytics YOLOv8 model that:
+  * runs inference on a single frame (numpy BGR image)
+  * draws bounding boxes with a consistent color scheme
+  * returns structured counts (people wearing / not wearing each PPE item)
+
+Works with:
+  1. A PPE-specific fine-tuned model (recommended) — e.g. a model trained on the
+     public "Construction Site Safety" dataset with classes like:
+     ['Hardhat', 'Mask', 'NO-Hardhat', 'NO-Mask', 'NO-Safety Vest',
+      'Person', 'Safety Cone', 'Safety Vest', 'machinery', 'vehicle']
+  2. A generic COCO YOLOv8 model (yolov8n.pt) as a fallback — this can only
+     detect 'person', not helmets/vests, so counts for PPE items will be empty.
+     The app will warn you in the UI if it detects you're using a COCO-only model.
+"""
+
+from __future__ import annotations
+import os
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple
+
+import cv2
+import numpy as np
+from ultralytics import YOLO
+
+# ---------------------------------------------------------------------------
+# Class-name groupings. Edit these lists if your model uses different labels.
+# ---------------------------------------------------------------------------
+POSITIVE_CLASSES = {"Hardhat", "Safety Vest", "helmet", "vest", "Mask"}
+NEGATIVE_CLASSES = {"NO-Hardhat", "NO-Safety Vest", "no-helmet", "no-vest", "NO-Mask"}
+PERSON_CLASSES = {"Person", "person"}
+
+COLOR_MAP = {
+    "Hardhat": (0, 200, 0),
+    "helmet": (0, 200, 0),
+    "Safety Vest": (0, 165, 255),
+    "vest": (0, 165, 255),
+    "NO-Hardhat": (0, 0, 255),
+    "no-helmet": (0, 0, 255),
+    "NO-Safety Vest": (0, 0, 200),
+    "no-vest": (0, 0, 200),
+    "Person": (255, 200, 0),
+    "person": (255, 200, 0),
+}
+DEFAULT_COLOR = (200, 200, 200)
+
+
+@dataclass
+class DetectionResult:
+    annotated_frame: np.ndarray
+    class_counts: Dict[str, int] = field(default_factory=dict)
+    total_detections: int = 0
+    compliant_people: int = 0      # heuristically: has hardhat & vest, no NO-* flags
+    non_compliant_people: int = 0  # any NO-* class detected
+
+
+class PPEDetector:
+    def __init__(self, model_path: str = "models/ppe.pt", conf: float = 0.4, iou: float = 0.45):
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(
+                f"Model weights not found at '{model_path}'.\n"
+                f"Place your PPE-trained YOLOv8 weights there, or point to yolov8n.pt "
+                f"for a quick (person-only) test. See README.md for download links."
+            )
+        self.model = YOLO(model_path)
+        self.conf = conf
+        self.iou = iou
+        self.class_names = self.model.names  # dict: id -> name
+
+    def is_coco_only(self) -> bool:
+        """Returns True if the loaded model only knows generic COCO classes
+        (i.e. it cannot actually detect helmets/vests)."""
+        names = set(self.class_names.values())
+        return len(names & (POSITIVE_CLASSES | NEGATIVE_CLASSES)) == 0
+
+    def detect(self, frame_bgr: np.ndarray) -> DetectionResult:
+        results = self.model.predict(
+            frame_bgr, conf=self.conf, iou=self.iou, verbose=False
+        )[0]
+
+        annotated = frame_bgr.copy()
+        class_counts: Dict[str, int] = {}
+        no_flags = 0
+        has_person = False
+
+        for box in results.boxes:
+            cls_id = int(box.cls[0])
+            label = self.class_names.get(cls_id, str(cls_id))
+            conf = float(box.conf[0])
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+            class_counts[label] = class_counts.get(label, 0) + 1
+            if label in NEGATIVE_CLASSES:
+                no_flags += 1
+            if label in PERSON_CLASSES:
+                has_person = True
+
+            color = COLOR_MAP.get(label, DEFAULT_COLOR)
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+            text = f"{label} {conf:.2f}"
+            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            cv2.rectangle(annotated, (x1, y1 - th - 8), (x1 + tw + 4, y1), color, -1)
+            cv2.putText(
+                annotated, text, (x1 + 2, y1 - 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA,
+            )
+
+        person_count = class_counts.get("Person", class_counts.get("person", 0))
+        non_compliant = no_flags
+        compliant = max(person_count - non_compliant, 0) if person_count else 0
+
+        return DetectionResult(
+            annotated_frame=annotated,
+            class_counts=class_counts,
+            total_detections=int(sum(class_counts.values())),
+            compliant_people=compliant,
+            non_compliant_people=non_compliant,
+        )
